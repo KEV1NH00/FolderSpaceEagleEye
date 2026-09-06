@@ -48,3 +48,8 @@ run.bat                     # Windows 快捷运行脚本
 ## 截图
 
 （欢迎补充截图）
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
+
