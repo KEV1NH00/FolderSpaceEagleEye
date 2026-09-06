@@ -47,7 +47,7 @@ run.bat                     # Windows 快捷运行脚本
 
 ## 截图
 
-（欢迎补充截图）
+![主界面](screenshot.png)
 
 ## 许可证
 
