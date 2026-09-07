@@ -20,3 +20,6 @@ Thumbs.db
 .dsh/memory/facts/01M1V6KPYS57T4H0QTP799QKHB.md
 .dsh/memory/MEMORY.md
 .gitignore
+
+# 其他
+.dsh/

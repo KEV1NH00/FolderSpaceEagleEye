@@ -1,4 +1,5 @@
 import os
+import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -7,6 +8,16 @@ from PIL import Image, ImageDraw, ImageTk
 
 
 SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
+
+# Maps a size unit suffix to a byte multiplier (used for sorting on raw values).
+UNIT_FACTORS = {
+    "B": 1,
+    "KB": 1024,
+    "MB": 1024 ** 2,
+    "GB": 1024 ** 3,
+    "TB": 1024 ** 4,
+    "PB": 1024 ** 5,
+}
 
 
 def format_size(size_bytes: int) -> str:
@@ -29,7 +40,7 @@ def get_folder_size(folder_path: str) -> tuple[int, int]:
                 try:
                     fp = os.path.join(dirpath, fname)
                     stat = os.lstat(fp)
-                    if stat.st_ino == 0 or os.path.islink(fp):
+                    if os.path.islink(fp):
                         continue
                     total_size += stat.st_size
                     file_count += 1
@@ -52,6 +63,9 @@ class FolderSpaceEagleEye:
         self.scan_cancelled = False
         self.executor = None
         self._path_cache = {}
+        # Thread-safe bridge from worker threads to the Tk UI thread.
+        self._ui_queue = queue.Queue()
+        self._poll_ui_queue()
 
         self._make_icons()
         self._setup_styles()
@@ -150,7 +164,12 @@ class FolderSpaceEagleEye:
             [pupil_margin, pupil_margin, size - pupil_margin, size - pupil_margin],
             fill=(13, 71, 161, 255),
         )
-        img.save(icon_path, format="ICO", sizes=[(32, 32)])
+        try:
+            img.save(icon_path, format="ICO", sizes=[(32, 32)])
+        except OSError:
+            # The committed app.ico may be read-only (e.g. running from dist\);
+            # skip regeneration and just use the in-memory icon.
+            pass
         self.root.iconphoto(True, ImageTk.PhotoImage(img))
 
     def _setup_styles(self):
@@ -176,9 +195,6 @@ class FolderSpaceEagleEye:
         )
         style.configure(
             "Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold")
-        )
-        style.configure(
-            "Treeview", font=("Microsoft YaHei UI", 10), rowheight=26, background="white",
         )
         style.configure(
             "Treeview", font=("Microsoft YaHei UI", 10), rowheight=26, background="white",
@@ -279,6 +295,7 @@ class FolderSpaceEagleEye:
 
         self.tree.bind("<Button-2>", self._on_tree_right_click)
         self.tree.bind("<Button-3>", self._on_tree_right_click)
+        self.tree.bind("<Double-Button-1>", self._on_tree_double_click)
 
         self.empty_label = ttk.Label(
             self.tree,
@@ -335,6 +352,20 @@ class FolderSpaceEagleEye:
         y = (sh - h) // 2
         self.root.geometry(f"+{x}+{y}")
 
+    def _post(self, callback, *args):
+        """Thread-safely schedule a callback to run on the Tk UI thread."""
+        self._ui_queue.put((callback, args))
+
+    def _poll_ui_queue(self):
+        """Drain queued UI callbacks on the main thread; reschedules itself."""
+        try:
+            while True:
+                callback, args = self._ui_queue.get_nowait()
+                callback(*args)
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_ui_queue)
+
     def _browse_folder(self):
         folder = filedialog.askdirectory(title="选择要分析的文件夹")
         if folder:
@@ -342,6 +373,8 @@ class FolderSpaceEagleEye:
             self._show_empty()
 
     def _start_scan(self):
+        if self.scanning:
+            return
         target = self.path_var.get().strip()
         if not target:
             messagebox.showwarning("提示", "请先选择一个文件夹。")
@@ -371,7 +404,7 @@ class FolderSpaceEagleEye:
 
     def _scan_single_folder(self, folder_path: str) -> tuple[int, int]:
         name = os.path.basename(folder_path)
-        self.root.after(0, self.status_var.set, f"正在扫描: {name}  [{folder_path}]")
+        self._post(self.status_var.set, f"正在扫描: {name}  [{folder_path}]")
         return get_folder_size(folder_path)
 
     def _scan_worker(self, target: str):
@@ -385,15 +418,15 @@ class FolderSpaceEagleEye:
             pass
 
         if not subdirs:
-            self.root.after(0, self._scan_empty_result)
+            self._post(self._scan_empty_result)
             return
 
         total_subdirs = len(subdirs)
         grand_total = 0
         results = []
 
-        self.root.after(0, self.status_var.set,
-                        f"正在分析 {total_subdirs} 个子文件夹...")
+        self._post(self.status_var.set,
+                   f"正在分析 {total_subdirs} 个子文件夹...")
 
         self.executor = ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 16))
         futures = {}
@@ -414,8 +447,7 @@ class FolderSpaceEagleEye:
                 results.append((name, sd, size, fcount))
                 grand_total += size
                 completed += 1
-                self.root.after(
-                    0,
+                self._post(
                     self.status_var.set,
                     f"已分析 {completed}/{total_subdirs}  —  {name}",
                 )
@@ -425,14 +457,12 @@ class FolderSpaceEagleEye:
                 self.executor = None
 
         if self.scan_cancelled:
-            self.root.after(0, self._on_scan_finished)
+            self._post(self._on_scan_finished)
             return
 
         results.sort(key=lambda r: r[2], reverse=True)
 
-        self.root.after(
-            0, self._populate_results, results, grand_total
-        )
+        self._post(self._populate_results, results, grand_total)
 
     def _populate_results(self, results: list, grand_total: int):
         if not self.scanning:
@@ -450,7 +480,7 @@ class FolderSpaceEagleEye:
                     f"{pct:.1f}%",
                 ),
             )
-            self._path_cache[item_id] = full_path
+            self._path_cache[item_id] = (full_path, size)
 
         self.status_var.set(
             f"完成 — {len(results)} 个子文件夹，合计 {format_size(grand_total)}"
@@ -546,38 +576,39 @@ class FolderSpaceEagleEye:
             self._sort_state["column"] = column
             self._sort_state["reverse"] = (column == "size")
 
-        col_map = {"name": 0, "size": 1, "files": 2, "percent": 3}
-        items = [(self.tree.set(i, column), i) for i in self.tree.get_children("")]
+        def parse_size(val: str) -> float:
+            parts = val.split()
+            if len(parts) != 2:
+                return 0.0
+            try:
+                num = float(parts[0])
+            except ValueError:
+                return 0.0
+            return num * UNIT_FACTORS.get(parts[1].upper(), 1)
 
-        if column == "size":
-            def parse_size(val: str) -> float:
-                parts = val.split()
-                if len(parts) != 2:
-                    return 0.0
+        def sort_key(item_id: str):
+            if column == "name":
+                return self.tree.set(item_id, "name").lower()
+            if column == "size":
+                return parse_size(self.tree.set(item_id, "size"))
+            if column == "files":
+                val = self.tree.set(item_id, "files").replace(",", "")
                 try:
-                    num = float(parts[0])
-                except ValueError:
-                    return 0.0
-                unit = parts[1].upper()
-                factors = {"B": 1, "KB": 1024, "MB": 1024**2,
-                           "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
-                return num * factors.get(unit, 1)
-            key_func = lambda x: parse_size(x[0])
-        elif column == "files":
-            def parse_files(val: str) -> int:
-                try:
-                    return int(val.replace(",", ""))
+                    return int(val)
                 except ValueError:
                     return 0
-            key_func = lambda x: parse_files(x[0])
-        elif column == "percent":
-            key_func = lambda x: float(x[0].rstrip("%")) if x[0] else 0.0
-        else:
-            key_func = lambda x: x[0].lower()
+            if column == "percent":
+                val = self.tree.set(item_id, "percent").rstrip("%")
+                try:
+                    return float(val)
+                except ValueError:
+                    return 0.0
+            return self.tree.set(item_id, column)
 
-        items.sort(key=key_func, reverse=self._sort_state["reverse"])
+        items = list(self.tree.get_children(""))
+        items.sort(key=sort_key, reverse=self._sort_state["reverse"])
 
-        for idx, (_, item_id) in enumerate(items):
+        for idx, item_id in enumerate(items):
             self.tree.move(item_id, "", idx)
 
     def _on_tree_right_click(self, event):
@@ -587,7 +618,8 @@ class FolderSpaceEagleEye:
         if not item_id:
             return
         self.tree.selection_set(item_id)
-        full_path = self._path_cache.get(item_id)
+        cached = self._path_cache.get(item_id)
+        full_path = cached[0] if isinstance(cached, tuple) else cached
         if not full_path or not os.path.isdir(full_path):
             return
 
@@ -601,6 +633,18 @@ class FolderSpaceEagleEye:
             command=lambda: self._analyze_from_menu(full_path),
         )
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_tree_double_click(self, event):
+        if self.scanning:
+            return
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        cached = self._path_cache.get(item_id)
+        full_path = cached[0] if isinstance(cached, tuple) else cached
+        if not full_path or not os.path.isdir(full_path):
+            return
+        self._analyze_from_menu(full_path)
 
     def _analyze_from_menu(self, full_path: str):
         self.path_var.set(full_path)
